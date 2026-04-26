@@ -101,3 +101,53 @@ class DriftWatch:
         r = self.client.get("/health")
         r.raise_for_status()
         return r.json()
+    
+    # ── Alerts ───────────────────────────────────────────────────────────────
+
+    def list_alerts(self, endpoint_id: str = None, domain: str = None,
+                    severity: str = None, resolved: bool = None):
+        params = {}
+        if endpoint_id:
+            params["endpoint_id"] = endpoint_id
+        if domain:
+            params["domain"] = domain
+        if severity:
+            params["severity"] = severity
+        if resolved is not None:
+            params["resolved"] = resolved
+        r = self.client.get("/alerts", params=params)
+        r.raise_for_status()
+        return r.json()
+
+    def get_alert(self, alert_id: str):
+        r = self.client.get(f"/alerts/{alert_id}")
+        r.raise_for_status()
+        return r.json()
+
+    def resolve_alert(self, alert_id: str):
+        r = self.client.patch(f"/alerts/{alert_id}/resolve")
+        r.raise_for_status()
+        return r.json()
+
+    # ── Webhooks ─────────────────────────────────────────────────────────────
+
+    def create_webhook(self, name: str, url: str,
+                       on_drift: bool = True, min_severity: str = "high"):
+        r = self.client.post("/webhooks", json={
+            "name": name,
+            "url": url,
+            "on_drift": on_drift,
+            "min_severity": min_severity
+        })
+        r.raise_for_status()
+        return r.json()
+
+    def list_webhooks(self):
+        r = self.client.get("/webhooks")
+        r.raise_for_status()
+        return r.json()
+
+    def delete_webhook(self, webhook_id: str):
+        r = self.client.delete(f"/webhooks/{webhook_id}")
+        r.raise_for_status()
+        return r.json()

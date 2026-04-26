@@ -47,6 +47,25 @@ class DriftWatch {
   // Utils
   stats() { return this._request("GET", "/dashboard/stats"); }
   health() { return this._request("GET", "/health"); }
+
+  // Alerts
+  listAlerts(endpointId = null, domain = null, severity = null, resolved = null) {
+    return this._request("GET", "/alerts", null, {
+      endpoint_id: endpointId, domain, severity,
+      resolved: resolved !== null ? resolved : undefined
+    });
+  }
+  getAlert(alertId) { return this._request("GET", `/alerts/${alertId}`); }
+  resolveAlert(alertId) { return this._request("PATCH", `/alerts/${alertId}/resolve`); }
+
+  // Webhooks
+  createWebhook(name, url, onDrift = true, minSeverity = "high") {
+    return this._request("POST", "/webhooks", {
+      name, url, on_drift: onDrift, min_severity: minSeverity
+    });
+  }
+  listWebhooks() { return this._request("GET", "/webhooks"); }
+  deleteWebhook(webhookId) { return this._request("DELETE", `/webhooks/${webhookId}`); }
 }
 
 module.exports = DriftWatch;
