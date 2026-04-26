@@ -22,7 +22,7 @@ HEADERS = {
 app = FastAPI(
     title="DriftWatch",
     description="Semantic drift and model staleness monitor. Know when your model no longer knows what is true.",
-    version="0.2.0"
+    version="0.3.0"
 )
 
 app.add_middleware(
@@ -627,4 +627,259 @@ def dashboard_stats():
             "domains": domains,
             "recent_checks": checks[:10],
             "recent_alerts": recent_alerts
+        }
+
+# ─── Trends and Decay Curves ───────────────────────────────────────────────────
+
+@app.get("/trends/{endpoint_id}")
+def get_staleness_trend(
+    endpoint_id: str,
+    domain: Optional[str] = Query(default=None),
+    limit: int = Query(default=20)
+):
+    with db() as client:
+        # Verify endpoint exists
+        ep_r = client.get("/model_endpoints", params={"id": f"eq.{endpoint_id}"})
+        if not ep_r.json():
+            raise HTTPException(status_code=404, detail="Endpoint not found")
+
+        params = {
+            "endpoint_id": f"eq.{endpoint_id}",
+            "order": "run_at.asc",
+            "limit": str(limit),
+            "select": "id,domain,run_at,staleness_score,drift_detected,passed,failed,total_anchors"
+        }
+        if domain:
+            params["domain"] = f"eq.{domain}"
+
+        r = client.get("/drift_checks", params=params)
+        checks = r.json()
+
+        if not checks:
+            return {
+                "endpoint_id": endpoint_id,
+                "domain": domain,
+                "data_points": [],
+                "message": "No checks run yet"
+            }
+
+        # Build decay curve — score over time
+        data_points = []
+        for i, check in enumerate(checks):
+            point = {
+                "index": i + 1,
+                "run_at": check["run_at"],
+                "domain": check["domain"],
+                "staleness_score": check["staleness_score"],
+                "drift_detected": check["drift_detected"],
+                "passed": check["passed"],
+                "failed": check["failed"],
+                "total_anchors": check["total_anchors"]
+            }
+            # Delta from previous point
+            if i > 0:
+                prev_score = checks[i - 1]["staleness_score"]
+                point["delta"] = round(check["staleness_score"] - prev_score, 4)
+                point["trend"] = "improving" if point["delta"] > 0 else ("stable" if point["delta"] == 0 else "degrading")
+            else:
+                point["delta"] = 0.0
+                point["trend"] = "baseline"
+            data_points.append(point)
+
+        # Summary stats
+        scores = [c["staleness_score"] for c in checks]
+        latest_score = scores[-1] if scores else None
+        first_score = scores[0] if scores else None
+        total_decay = round(first_score - latest_score, 4) if (first_score is not None and latest_score is not None) else 0.0
+        drift_events = sum(1 for c in checks if c.get("drift_detected"))
+
+        return {
+            "endpoint_id": endpoint_id,
+            "domain": domain,
+            "total_checks": len(checks),
+            "first_score": first_score,
+            "latest_score": latest_score,
+            "total_decay": total_decay,
+            "drift_events": drift_events,
+            "decay_direction": "degrading" if total_decay < 0 else ("improving" if total_decay > 0 else "stable"),
+            "data_points": data_points
+        }
+
+
+@app.get("/trends/{endpoint_id}/domains")
+def get_domain_breakdown(endpoint_id: str):
+    with db() as client:
+        ep_r = client.get("/model_endpoints", params={"id": f"eq.{endpoint_id}"})
+        endpoints = ep_r.json()
+        if not endpoints:
+            raise HTTPException(status_code=404, detail="Endpoint not found")
+        endpoint = endpoints[0]
+
+        # Get all checks for this endpoint
+        checks_r = client.get("/drift_checks", params={
+            "endpoint_id": f"eq.{endpoint_id}",
+            "order": "run_at.asc"
+        })
+        checks = checks_r.json()
+
+        # Group by domain
+        domain_map = {}
+        for check in checks:
+            d = check.get("domain") or "all"
+            if d not in domain_map:
+                domain_map[d] = []
+            domain_map[d].append(check)
+
+        domain_summaries = []
+        for domain, domain_checks in domain_map.items():
+            scores = [c["staleness_score"] for c in domain_checks]
+            latest = domain_checks[-1]
+            first = domain_checks[0]
+            drift_count = sum(1 for c in domain_checks if c.get("drift_detected"))
+            total_decay = round(scores[0] - scores[-1], 4) if len(scores) > 1 else 0.0
+
+            domain_summaries.append({
+                "domain": domain,
+                "check_count": len(domain_checks),
+                "first_score": scores[0],
+                "latest_score": scores[-1],
+                "best_score": max(scores),
+                "worst_score": min(scores),
+                "total_decay": total_decay,
+                "drift_events": drift_count,
+                "last_checked": latest["run_at"],
+                "decay_direction": "degrading" if total_decay > 0 else ("improving" if total_decay < 0 else "stable")
+            })
+
+        # Sort by worst latest score first
+        domain_summaries.sort(key=lambda x: x["latest_score"])
+
+        return {
+            "endpoint_id": endpoint_id,
+            "endpoint_name": endpoint["name"],
+            "total_domains": len(domain_summaries),
+            "domains": domain_summaries
+        }
+
+
+# ─── Domain Analytics ──────────────────────────────────────────────────────────
+
+@app.get("/domains")
+def list_domains():
+    with db() as client:
+        anchors_r = client.get("/fact_anchors", params={"active": "eq.true"})
+        anchors = anchors_r.json()
+
+        # Group anchors by domain
+        domain_map = {}
+        for anchor in anchors:
+            d = anchor["domain"]
+            if d not in domain_map:
+                domain_map[d] = {"anchor_count": 0, "contributed_by": set()}
+            domain_map[d]["anchor_count"] += 1
+            if anchor.get("contributed_by"):
+                domain_map[d]["contributed_by"].add(anchor["contributed_by"])
+
+        # Get latest check per domain across all endpoints
+        checks_r = client.get("/drift_checks", params={"order": "run_at.desc", "limit": "200"})
+        checks = checks_r.json()
+
+        latest_per_domain = {}
+        for check in checks:
+            d = check.get("domain") or "all"
+            if d not in latest_per_domain:
+                latest_per_domain[d] = check
+
+        result = []
+        for domain, info in domain_map.items():
+            latest = latest_per_domain.get(domain)
+            result.append({
+                "domain": domain,
+                "anchor_count": info["anchor_count"],
+                "contributors": list(info["contributed_by"]),
+                "latest_staleness_score": latest["staleness_score"] if latest else None,
+                "last_checked": latest["run_at"] if latest else None,
+                "drift_detected_last_check": latest["drift_detected"] if latest else None
+            })
+
+        # Sort: never checked last, then by worst staleness
+        result.sort(key=lambda x: (
+            x["latest_staleness_score"] is None,
+            x["latest_staleness_score"] if x["latest_staleness_score"] is not None else 0
+        ))
+
+        return {"total_domains": len(result), "domains": result}
+
+
+@app.get("/domains/{domain}/summary")
+def get_domain_summary(domain: str):
+    with db() as client:
+        # Anchors in this domain
+        anchors_r = client.get("/fact_anchors", params={
+            "domain": f"eq.{domain}",
+            "active": "eq.true"
+        })
+        anchors = anchors_r.json()
+
+        if not anchors:
+            raise HTTPException(status_code=404, detail=f"No active anchors found for domain '{domain}'")
+
+        # All checks for this domain
+        checks_r = client.get("/drift_checks", params={
+            "domain": f"eq.{domain}",
+            "order": "run_at.desc",
+            "limit": "50"
+        })
+        checks = checks_r.json()
+
+        # All alerts for this domain
+        alerts_r = client.get("/drift_alerts", params={
+            "domain": f"eq.{domain}",
+            "order": "created_at.desc",
+            "limit": "20"
+        })
+        alerts = alerts_r.json()
+
+        # Endpoints that have been checked for this domain
+        endpoint_ids = list(set(c["endpoint_id"] for c in checks))
+        endpoints_checked = []
+        for eid in endpoint_ids:
+            ep_r = client.get("/model_endpoints", params={"id": f"eq.{eid}"})
+            ep_data = ep_r.json()
+            if ep_data:
+                ep = ep_data[0]
+                # Latest check for this endpoint + domain
+                latest_check = next((c for c in checks if c["endpoint_id"] == eid), None)
+                endpoints_checked.append({
+                    "endpoint_id": eid,
+                    "endpoint_name": ep["name"],
+                    "latest_staleness_score": latest_check["staleness_score"] if latest_check else None,
+                    "last_checked": latest_check["run_at"] if latest_check else None
+                })
+
+        # Staleness trend — last 10 checks chronologically
+        trend = list(reversed(checks[:10]))
+        scores = [c["staleness_score"] for c in trend]
+
+        drift_event_count = sum(1 for c in checks if c.get("drift_detected"))
+        unresolved_alerts = sum(1 for a in alerts if not a.get("resolved"))
+        latest_score = checks[0]["staleness_score"] if checks else None
+
+        return {
+            "domain": domain,
+            "anchor_count": len(anchors),
+            "anchors": anchors,
+            "total_checks": len(checks),
+            "drift_events": drift_event_count,
+            "unresolved_alerts": unresolved_alerts,
+            "latest_staleness_score": latest_score,
+            "staleness_status": (
+                "healthy" if latest_score is not None and latest_score >= 0.8 else
+                "degraded" if latest_score is not None and latest_score >= 0.5 else
+                "stale" if latest_score is not None else
+                "unchecked"
+            ),
+            "endpoints_checked": endpoints_checked,
+            "staleness_trend": trend,
+            "recent_alerts": alerts[:5]
         }

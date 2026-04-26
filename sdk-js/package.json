@@ -1,6 +1,6 @@
 {
   "name": "thread-driftwatch",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DriftWatch JavaScript SDK — semantic drift and model staleness monitor. Part of the Thread Suite.",
   "main": "index.js",
   "dependencies": {
