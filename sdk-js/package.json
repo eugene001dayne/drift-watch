@@ -1,0 +1,16 @@
+{
+  "name": "thread-driftwatch",
+  "version": "0.1.0",
+  "description": "DriftWatch JavaScript SDK — semantic drift and model staleness monitor. Part of the Thread Suite.",
+  "main": "index.js",
+  "dependencies": {
+    "node-fetch": "^2.6.7"
+  },
+  "keywords": ["ai", "drift", "staleness", "monitoring", "llm", "thread-suite"],
+  "author": "Eugene Dayne Mawuli",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eugene001dayne/drift-watch"
+  }
+}
