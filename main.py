@@ -22,7 +22,7 @@ HEADERS = {
 app = FastAPI(
     title="DriftWatch",
     description="Semantic drift and model staleness monitor. Know when your model no longer knows what is true.",
-    version="0.3.0"
+    version="0.4.0"
 )
 
 app.add_middleware(
@@ -123,6 +123,14 @@ class WebhookCreate(BaseModel):
 class AlertResolve(BaseModel):
     note: Optional[str] = None
 
+class ContributionCreate(BaseModel):
+    domain: str
+    question: str
+    expected_contains: str
+    source_url: str
+    contributed_by: Optional[str] = None
+    notes: Optional[str] = None
+
 
 # ─── Status ────────────────────────────────────────────────────────────────────
 
@@ -158,7 +166,8 @@ def create_anchor(body: AnchorCreate):
             "source_url": body.source_url,
             "verified_at": body.verified_at,
             "contributed_by": body.contributed_by,
-            "active": True
+            "active": True,
+            "status": "active"
         })
         if r.status_code not in (200, 201):
             raise HTTPException(status_code=500, detail=r.text)
@@ -627,6 +636,182 @@ def dashboard_stats():
             "domains": domains,
             "recent_checks": checks[:10],
             "recent_alerts": recent_alerts
+        }
+
+# ─── Community Contributions ───────────────────────────────────────────────────
+
+@app.post("/contribute")
+def submit_contribution(body: ContributionCreate):
+    """
+    Open endpoint for community fact contributions.
+    Submitted anchors enter 'pending' state and require approval before use in checks.
+    source_url is required — all community facts must cite a source.
+    """
+    if not body.source_url or not body.source_url.startswith("http"):
+        raise HTTPException(
+            status_code=400,
+            detail="source_url is required for community contributions and must be a valid URL."
+        )
+
+    with db() as client:
+        r = client.post("/fact_anchors", json={
+            "domain": body.domain,
+            "question": body.question,
+            "expected_contains": body.expected_contains,
+            "source_url": body.source_url,
+            "contributed_by": body.contributed_by,
+            "active": False,
+            "status": "pending"
+        })
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=500, detail=r.text)
+        anchor = r.json()[0]
+
+        return {
+            "message": "Contribution received. It will be reviewed before becoming active.",
+            "anchor_id": anchor["id"],
+            "domain": anchor["domain"],
+            "question": anchor["question"],
+            "expected_contains": anchor["expected_contains"],
+            "source_url": anchor["source_url"],
+            "contributed_by": anchor["contributed_by"],
+            "status": "pending",
+            "created_at": anchor["created_at"]
+        }
+
+
+@app.get("/contribute/pending")
+def list_pending_contributions(domain: Optional[str] = Query(default=None)):
+    with db() as client:
+        params = {
+            "status": "eq.pending",
+            "order": "created_at.asc"
+        }
+        if domain:
+            params["domain"] = f"eq.{domain}"
+        r = client.get("/fact_anchors", params=params)
+        pending = r.json()
+        return {
+            "total_pending": len(pending),
+            "contributions": pending
+        }
+
+
+@app.post("/contribute/{anchor_id}/approve")
+def approve_contribution(anchor_id: str):
+    with db() as client:
+        # Check it exists and is pending
+        r = client.get("/fact_anchors", params={"id": f"eq.{anchor_id}"})
+        anchors = r.json()
+        if not anchors:
+            raise HTTPException(status_code=404, detail="Anchor not found")
+        anchor = anchors[0]
+        if anchor["status"] != "pending":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Anchor is not pending. Current status: {anchor['status']}"
+            )
+
+        # Approve — set active and status
+        upd = client.patch(
+            "/fact_anchors",
+            params={"id": f"eq.{anchor_id}"},
+            json={"active": True, "status": "active"}
+        )
+        if upd.status_code not in (200, 201):
+            raise HTTPException(status_code=500, detail=upd.text)
+
+        return {
+            "approved": True,
+            "anchor_id": anchor_id,
+            "domain": anchor["domain"],
+            "question": anchor["question"],
+            "message": "Anchor is now active and will be included in drift checks."
+        }
+
+
+@app.post("/contribute/{anchor_id}/reject")
+def reject_contribution(anchor_id: str, reason: Optional[str] = Query(default=None)):
+    with db() as client:
+        r = client.get("/fact_anchors", params={"id": f"eq.{anchor_id}"})
+        anchors = r.json()
+        if not anchors:
+            raise HTTPException(status_code=404, detail="Anchor not found")
+        anchor = anchors[0]
+        if anchor["status"] != "pending":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Anchor is not pending. Current status: {anchor['status']}"
+            )
+
+        upd = client.patch(
+            "/fact_anchors",
+            params={"id": f"eq.{anchor_id}"},
+            json={
+                "active": False,
+                "status": "rejected",
+                "rejection_reason": reason or "No reason provided"
+            }
+        )
+        if upd.status_code not in (200, 201):
+            raise HTTPException(status_code=500, detail=upd.text)
+
+        return {
+            "rejected": True,
+            "anchor_id": anchor_id,
+            "domain": anchor["domain"],
+            "question": anchor["question"],
+            "rejection_reason": reason or "No reason provided"
+        }
+
+
+@app.get("/contribute/stats")
+def contribution_stats():
+    with db() as client:
+        all_r = client.get("/fact_anchors", params={"order": "created_at.desc"})
+        all_anchors = all_r.json()
+
+        active = [a for a in all_anchors if a["status"] == "active"]
+        pending = [a for a in all_anchors if a["status"] == "pending"]
+        rejected = [a for a in all_anchors if a["status"] == "rejected"]
+
+        # Contributor leaderboard
+        contributor_map = {}
+        for anchor in all_anchors:
+            contributor = anchor.get("contributed_by") or "anonymous"
+            if contributor not in contributor_map:
+                contributor_map[contributor] = {"total": 0, "active": 0, "pending": 0, "rejected": 0}
+            contributor_map[contributor]["total"] += 1
+            contributor_map[contributor][anchor["status"]] += 1
+
+        leaderboard = sorted(
+            [{"contributor": k, **v} for k, v in contributor_map.items()],
+            key=lambda x: x["active"],
+            reverse=True
+        )
+
+        # Domain coverage
+        domain_map = {}
+        for anchor in active:
+            d = anchor["domain"]
+            if d not in domain_map:
+                domain_map[d] = 0
+            domain_map[d] += 1
+
+        domain_coverage = sorted(
+            [{"domain": k, "active_anchors": v} for k, v in domain_map.items()],
+            key=lambda x: x["active_anchors"],
+            reverse=True
+        )
+
+        return {
+            "total_anchors": len(all_anchors),
+            "active": len(active),
+            "pending": len(pending),
+            "rejected": len(rejected),
+            "total_contributors": len(contributor_map),
+            "leaderboard": leaderboard,
+            "domain_coverage": domain_coverage
         }
 
 # ─── Trends and Decay Curves ───────────────────────────────────────────────────
