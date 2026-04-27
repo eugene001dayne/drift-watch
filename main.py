@@ -22,7 +22,7 @@ HEADERS = {
 app = FastAPI(
     title="DriftWatch",
     description="Semantic drift and model staleness monitor. Know when your model no longer knows what is true.",
-    version="0.4.0"
+    version="0.5.0"
 )
 
 app.add_middleware(
@@ -129,6 +129,13 @@ class ContributionCreate(BaseModel):
     expected_contains: str
     source_url: str
     contributed_by: Optional[str] = None
+    notes: Optional[str] = None
+
+class PromptThreadLink(BaseModel):
+    prompt_id: str
+    prompt_version: Optional[int] = None
+    domain: str
+    endpoint_id: str
     notes: Optional[str] = None
 
 
@@ -638,6 +645,246 @@ def dashboard_stats():
             "recent_alerts": recent_alerts
         }
 
+# ─── Thread Suite Bridge ───────────────────────────────────────────────────────
+
+SUITE_URLS = {
+    "iron-thread":            "https://iron-thread.onrender.com",
+    "testthread":             "https://test-thread-cass.onrender.com",
+    "promptthread":           "https://prompt-thread.onrender.com",
+    "chainthread":            "https://chain-thread.onrender.com",
+    "policythread":           "https://policy-thread.onrender.com",
+    "threadwatch":            "https://thread-watch.onrender.com",
+    "behavioral-fingerprint": "https://behavioral-fingerprint.onrender.com"
+}
+
+
+@app.get("/bridge/status")
+def bridge_status():
+    statuses = {}
+    for tool, url in SUITE_URLS.items():
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                r = client.get(f"{url}/health")
+                statuses[tool] = "online" if r.status_code == 200 else "degraded"
+        except Exception:
+            statuses[tool] = "offline"
+    return {
+        "driftwatch": "online",
+        "suite": statuses
+    }
+
+
+@app.post("/bridge/promptthread")
+def link_to_promptthread(body: PromptThreadLink):
+    """
+    Links a DriftWatch domain's staleness status to a PromptThread prompt.
+    Call this after running a drift check on a domain that a specific prompt covers.
+    The link is informational — it surfaces drift context alongside prompt performance data.
+    """
+    with db() as client:
+        # Get latest check for this domain + endpoint
+        params = {
+            "endpoint_id": f"eq.{body.endpoint_id}",
+            "domain": f"eq.{body.domain}",
+            "order": "run_at.desc",
+            "limit": "5"
+        }
+        checks_r = client.get("/drift_checks", params=params)
+        checks = checks_r.json()
+
+        if not checks:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No drift checks found for domain '{body.domain}' on this endpoint. Run a check first."
+            )
+
+        latest = checks[0]
+
+        # Get unresolved alerts for this domain
+        alerts_r = client.get("/drift_alerts", params={
+            "domain": f"eq.{body.domain}",
+            "resolved": "eq.false",
+            "order": "created_at.desc",
+            "limit": "5"
+        })
+        unresolved_alerts = alerts_r.json()
+
+        # Build staleness trend from recent checks
+        trend = [
+            {
+                "run_at": c["run_at"],
+                "staleness_score": c["staleness_score"],
+                "drift_detected": c["drift_detected"]
+            }
+            for c in reversed(checks)
+        ]
+
+        staleness_score = latest["staleness_score"]
+        drift_detected = latest["drift_detected"]
+
+        # Determine staleness impact on prompt
+        if staleness_score >= 0.8:
+            impact = "low"
+            impact_note = "Domain knowledge appears current. Prompt likely unaffected by staleness."
+        elif staleness_score >= 0.5:
+            impact = "medium"
+            impact_note = "Some domain anchors failing. Prompt may be returning outdated information."
+        elif staleness_score >= 0.2:
+            impact = "high"
+            impact_note = "Majority of domain anchors failing. Prompt is likely returning stale answers."
+        else:
+            impact = "critical"
+            impact_note = "Domain knowledge severely stale. Prompt answers in this domain cannot be trusted."
+
+        return {
+            "prompt_id": body.prompt_id,
+            "prompt_version": body.prompt_version,
+            "domain": body.domain,
+            "endpoint_id": body.endpoint_id,
+            "staleness_score": staleness_score,
+            "drift_detected": drift_detected,
+            "staleness_impact": impact,
+            "impact_note": impact_note,
+            "unresolved_alerts": len(unresolved_alerts),
+            "alert_details": unresolved_alerts,
+            "staleness_trend": trend,
+            "notes": body.notes,
+            "recommendation": (
+                "No action needed." if impact == "low" else
+                "Monitor closely. Consider updating prompt with current information." if impact == "medium" else
+                "Action recommended. Update prompt or flag outputs in this domain for review." if impact == "high" else
+                "Immediate action required. Suspend prompt use in this domain or add strong disclaimers."
+            )
+        }
+
+
+@app.get("/bridge/promptthread/{prompt_id}")
+def get_promptthread_drift_context(prompt_id: str, domain: Optional[str] = Query(default=None)):
+    """
+    Returns all drift context relevant to a PromptThread prompt ID.
+    If domain is provided, filters to that domain only.
+    """
+    with db() as client:
+        params = {"order": "run_at.desc", "limit": "50"}
+        if domain:
+            params["domain"] = f"eq.{domain}"
+        checks_r = client.get("/drift_checks", params=params)
+        checks = checks_r.json()
+
+        alerts_r = client.get("/drift_alerts", params={
+            "resolved": "eq.false",
+            "order": "created_at.desc"
+        })
+        all_alerts = alerts_r.json()
+
+        if domain:
+            relevant_alerts = [a for a in all_alerts if a["domain"] == domain]
+        else:
+            relevant_alerts = all_alerts
+
+        # Domain staleness summary
+        domain_map = {}
+        for check in checks:
+            d = check.get("domain") or "all"
+            if d not in domain_map:
+                domain_map[d] = []
+            domain_map[d].append(check["staleness_score"])
+
+        domain_summary = []
+        for d, scores in domain_map.items():
+            domain_summary.append({
+                "domain": d,
+                "latest_staleness": scores[0],
+                "check_count": len(scores),
+                "status": (
+                    "healthy" if scores[0] >= 0.8 else
+                    "degraded" if scores[0] >= 0.5 else
+                    "stale"
+                )
+            })
+
+        overall_health = "healthy"
+        if any(d["status"] == "stale" for d in domain_summary):
+            overall_health = "stale"
+        elif any(d["status"] == "degraded" for d in domain_summary):
+            overall_health = "degraded"
+
+        return {
+            "prompt_id": prompt_id,
+            "domain_filter": domain,
+            "overall_domain_health": overall_health,
+            "unresolved_drift_alerts": len(relevant_alerts),
+            "domain_summary": domain_summary,
+            "recent_alerts": relevant_alerts[:5]
+        }
+
+
+@app.post("/bridge/threadwatch")
+def send_to_threadwatch():
+    """
+    Sends current DriftWatch staleness signals to ThreadWatch for pipeline-level correlation.
+    Call this after running drift checks to keep ThreadWatch aware of domain staleness state.
+    """
+    with db() as client:
+        checks_r = client.get("/drift_checks", params={
+            "order": "run_at.desc",
+            "limit": "20"
+        })
+        checks = checks_r.json()
+
+        alerts_r = client.get("/drift_alerts", params={
+            "resolved": "eq.false"
+        })
+        unresolved = alerts_r.json()
+
+        if not checks:
+            return {"sent": False, "reason": "No checks to report"}
+
+        latest = checks[0]
+        avg_staleness = round(
+            sum(c["staleness_score"] for c in checks) / len(checks), 4
+        ) if checks else 1.0
+        drift_events = sum(1 for c in checks if c.get("drift_detected"))
+
+        signal_payload = {
+            "source_tool": "driftwatch",
+            "signal_type": "staleness_report",
+            "payload": {
+                "avg_staleness_score": avg_staleness,
+                "drift_events_recent": drift_events,
+                "unresolved_alerts": len(unresolved),
+                "last_check_at": latest["run_at"],
+                "drift_detected": latest["drift_detected"]
+            }
+        }
+
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                r = client.post(
+                    f"{SUITE_URLS['threadwatch']}/external-signals",
+                    json={
+                        "signal_type": "staleness_report",
+                        "source": "driftwatch",
+                        "title": f"DriftWatch: avg staleness {avg_staleness}, {drift_events} drift events",
+                        "description": f"{len(unresolved)} unresolved alerts",
+                        "severity": (
+                            "critical" if avg_staleness < 0.3 else
+                            "high" if avg_staleness < 0.5 else
+                            "medium" if avg_staleness < 0.8 else
+                            "low"
+                        )
+                    }
+                )
+                threadwatch_received = r.status_code in (200, 201)
+        except Exception:
+            threadwatch_received = False
+
+        return {
+            "sent": True,
+            "threadwatch_received": threadwatch_received,
+            "signal": signal_payload
+        }
+        
 # ─── Community Contributions ───────────────────────────────────────────────────
 
 @app.post("/contribute")

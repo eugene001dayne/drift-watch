@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="thread-driftwatch",
-    version="0.4.0",
+    version="0.5.0",
     py_modules=["driftwatch"],
     package_dir={"": "."},
     install_requires=["httpx>=0.24.0"],
